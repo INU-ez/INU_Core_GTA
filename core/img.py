@@ -87,6 +87,14 @@ class ImgEntry:
     size: int     # size in sectors
 
 
+def _game_uses(cur, new) -> bool:
+    """True → ``new`` replaces ``cur`` as the same-name record the game
+    streams: the first one WITH data (``CStreaming::LoadCdDirectory`` skips
+    a name already registered, and ``CStreamingInfo::GetCdPosnAndSize`` is
+    false while size is 0, so an empty record doesn't register it)."""
+    return cur is None or (not cur.size and bool(new.size))
+
+
 def sectors_needed(byte_size: int) -> int:
     """Number of 2048-byte sectors needed to store *byte_size* bytes."""
     return (byte_size + SECTOR - 1) // SECTOR
@@ -159,14 +167,18 @@ def read_directory(filepath: str) -> list[ImgEntry]:
 
 
 def extract_file(img_path: str, entry_name: str) -> bytes | None:
-    """Extract a single file from an IMG archive by name."""
-    entries = read_directory(img_path)
-    for e in entries:
-        if e.name.lower() == entry_name.lower():
-            with open(img_path, 'rb') as f:
-                f.seek(e.offset * SECTOR)
-                return f.read(e.size * SECTOR)
-    return None
+    """Extract a single file from an IMG archive by name — the same-name
+    record the game streams (see ``_game_uses``)."""
+    key = entry_name.lower()
+    hit = None
+    for e in read_directory(img_path):
+        if e.name.lower() == key and _game_uses(hit, e):
+            hit = e
+    if hit is None:
+        return None
+    with open(img_path, 'rb') as f:
+        f.seek(hit.offset * SECTOR)
+        return f.read(hit.size * SECTOR)
 
 
 class ImgReader:
@@ -220,8 +232,11 @@ class ImgReader:
             raw = self._f.read(num * DIR_ENTRY_SIZE)
             self._entries = _parse_dir_records(raw)
 
+        # Same-name records: the one the game streams wins (``_game_uses``).
         for entry in self._entries:
-            self._lookup[entry.name.lower()] = entry
+            k = entry.name.lower()
+            if _game_uses(self._lookup.get(k), entry):
+                self._lookup[k] = entry
 
     def close(self):
         if self._f:
@@ -237,6 +252,14 @@ class ImgReader:
         e = self._lookup.get(entry_name.lower())
         if not e:
             return None
+        self._f.seek(e.offset * SECTOR)
+        return self._f.read(e.size * SECTOR)
+
+    def read_entry(self, e: ImgEntry) -> bytes:
+        """Data of one directory record (by its position, not by name —
+        duplicates and empty entries included)."""
+        if not e.size:
+            return b''
         self._f.seek(e.offset * SECTOR)
         return self._f.read(e.size * SECTOR)
 
@@ -261,8 +284,14 @@ class ImgReader:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Sort entries by offset for sequential disk read
-        sorted_entries = sorted(self._entries, key=lambda e: e.offset)
+        # Sort entries by offset for sequential disk read; of same-name
+        # records only the one the game streams is extracted, and not an
+        # empty one (holds no file — with skip_existing it would block the
+        # same name from a later archive).
+        sorted_entries = sorted(
+            (e for e in self._entries
+             if e.size and self._lookup.get(e.name.lower()) is e),
+            key=lambda e: e.offset)
 
         counts = {'dff': 0, 'col': 0, 'txd': 0, 'other': 0, 'skipped': 0}
 
@@ -445,6 +474,15 @@ class ImgWriter:
         self._lookup: dict[str, int] = {}
         self._end_pos: int = 0
 
+    def _register(self, i: int) -> None:
+        """Index record ``i`` by name — of same-name records the one the
+        game streams wins (``_game_uses``), so ``add`` replaces that one."""
+        e = self._entries[i]
+        k = e.name.lower()
+        j = self._lookup.get(k)
+        if _game_uses(None if j is None else self._entries[j], e):
+            self._lookup[k] = i
+
     def __enter__(self):
         # Auto-detect version when not pinned by caller. We do this BEFORE
         # opening so the right read path (embedded vs sibling .dir) is
@@ -470,7 +508,7 @@ class ImgWriter:
                     raw = df.read()
                 for i, e in enumerate(_parse_dir_records(raw)):
                     self._entries.append(e)
-                    self._lookup[e.name.lower()] = i
+                    self._register(i)
             self._f.seek(0, 2)
             self._end_pos = self._f.tell()
             return self
@@ -491,7 +529,7 @@ class ImgWriter:
         for i, e in enumerate(_parse_dir_records(
                 self._f.read(num * DIR_ENTRY_SIZE))):
             self._entries.append(e)
-            self._lookup[e.name.lower()] = i
+            self._register(i)
         # Remember current EOF so append operations don't have to
         # seek-to-end every time (which costs a syscall).
         self._f.seek(0, 2)
@@ -558,6 +596,17 @@ class ImgWriter:
         self._lookup[filename.lower()] = len(self._entries) - 1
         return 'added'
 
+    def append_entry(self, filename: str, data: bytes) -> None:
+        """Append a NEW directory record as is — no lookup, no name check
+        (rebuild_img: keeps duplicate names and empty entries of the source
+        archive, which ``add`` would merge or drop)."""
+        if self._f is None:
+            raise RuntimeError("ImgWriter used outside its 'with' block")
+        n = sectors_needed(len(data))
+        offset = self._append(data + b'\x00' * (n * SECTOR - len(data)))
+        self._entries.append(ImgEntry(name=filename, offset=offset, size=n))
+        self._register(len(self._entries) - 1)
+
     def __exit__(self, *args):
         if self._f is not None:
             try:
@@ -602,33 +651,63 @@ def rebuild_img(filepath: str) -> dict:
     in place (``ImgWriter.add`` repoints the directory but never reclaims the
     old slot, so repeated re-exports bloat the file).
 
-    Reads every live directory entry, writes a fresh archive with sequential
-    offsets, then atomically replaces the original (and its sibling ``.dir``
-    for VER1). Returns ``{'entries', 'old_size', 'new_size', 'saved'}`` (bytes).
+    Reads every directory record (duplicate names and empty entries
+    included), writes a fresh archive with sequential offsets, then
+    atomically replaces the original (and its sibling ``.dir`` for VER1).
+    Returns ``{'entries', 'old_size', 'new_size', 'saved'}`` (bytes).
     """
     version = detect_img_version(filepath)
     old_size = os.path.getsize(filepath)
-
-    # 1. Read every live entry's (sector-aligned) data.
-    with ImgReader(filepath) as r:
-        blobs = [(e.name, r.read(e.name)) for e in r.entries]
-
-    # 2. Write a fresh, compacted archive beside the original.
     tmp = filepath + '.rebuild_tmp'
     tmp_dir = _sibling_dir_path(tmp)
-    for _p in (tmp, tmp_dir):
+    dst_dir = _sibling_dir_path(filepath)
+    # VER1: a lone tmp_dir means an earlier rebuild swapped the .img but not
+    # the .dir — it is the only copy of the new directory, never delete it.
+    if (version == IMG_VERSION_1 and os.path.exists(tmp_dir)
+            and not os.path.exists(tmp)):
+        raise OSError(f"{tmp_dir} is left from an interrupted rebuild; "
+                      f"rename it to {dst_dir} by hand first")
+
+    # 1. Read every directory record's (sector-aligned) data BY POSITION —
+    #    reading by name returned one duplicate for both records and
+    #    ``if data`` dropped empty ones, so the rebuilt directory lost entries.
+    with ImgReader(filepath) as r:
+        blobs = [(e.name, r.read_entry(e)) for e in r.entries]
+
+    # 2. Write a fresh, compacted archive beside the original — same records
+    #    in the same order. tmp_dir goes first: if it can't be removed, tmp
+    #    stays beside it and the pair is never taken for a lone tmp_dir.
+    for _p in (tmp_dir, tmp):
         if os.path.exists(_p):
             os.remove(_p)
-    create_img(tmp, version=version)
-    with ImgWriter(tmp, version=version, reserve_entries=len(blobs)) as w:
-        for name, data in blobs:
-            if data:
-                w.add(name, data)
+    swapped = False
+    try:
+        create_img(tmp, version=version)
+        with ImgWriter(tmp, version=version, reserve_entries=len(blobs)) as w:
+            for name, data in blobs:
+                w.append_entry(name, data)
 
-    # 3. Atomically swap in the rebuilt archive (+ sibling .dir for VER1).
-    os.replace(tmp, filepath)
-    if version == IMG_VERSION_1 and os.path.exists(tmp_dir):
-        os.replace(tmp_dir, _sibling_dir_path(filepath))
+        # 3. Atomically swap in the rebuilt archive (+ sibling .dir for VER1).
+        os.replace(tmp, filepath)
+        swapped = True
+        if version == IMG_VERSION_1 and os.path.exists(tmp_dir):
+            try:
+                os.replace(tmp_dir, dst_dir)
+            except OSError as e:
+                raise OSError(f"{filepath} rebuilt, but {dst_dir} could not "
+                              f"be replaced ({e}); rename {tmp_dir} to "
+                              f"{dst_dir} by hand") from e
+    finally:
+        # Before the swap the original is untouched — drop the temp files
+        # (tmp_dir first: a lone tmp_dir must only ever mean "swapped", so
+        # if it can't be removed tmp is kept too — the next run clears both).
+        if not swapped:
+            for _p in (tmp_dir, tmp):
+                if os.path.exists(_p):
+                    try:
+                        os.remove(_p)
+                    except OSError:
+                        break
 
     new_size = os.path.getsize(filepath)
     return {'entries': len(blobs), 'old_size': old_size,
