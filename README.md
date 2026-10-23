@@ -1,6 +1,6 @@
 <div align="center">
 
-# INU Core GTA
+# INU Core GTA SA/VC/III
 
 **Pure-Python library for GTA SA / VC / III file formats — read, write and audit game files without Blender.**
 
